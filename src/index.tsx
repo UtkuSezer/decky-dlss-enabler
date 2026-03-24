@@ -87,30 +87,6 @@ const patchGame = callable<
 >("patch_game");
 const unpatchGame = callable<[appid: string], UnpatchResponse>("unpatch_game");
 
-const STYLES = {
-  statusCard: {
-    whiteSpace: "pre-wrap" as const,
-    lineHeight: 1.4,
-    fontSize: "13px",
-    padding: "12px",
-    borderRadius: "8px",
-    background: "rgba(255,255,255,0.06)",
-    width: "100%",
-  },
-  statusOk: {
-    border: "1px solid rgba(76, 175, 80, 0.45)",
-  },
-  statusNeutral: {
-    border: "1px solid rgba(255,255,255,0.12)",
-  },
-  statusWarn: {
-    border: "1px solid rgba(255, 193, 7, 0.45)",
-  },
-  statusError: {
-    border: "1px solid rgba(244, 67, 54, 0.45)",
-  },
-} as const;
-
 const getMethodHint = (method: string) =>
   METHOD_OPTIONS.find((entry) => entry.value === method)?.hint ?? "";
 
@@ -142,7 +118,7 @@ const setAppLaunchOptions = (appid: number, launchOptions: string) => {
 };
 
 let lastSelectedAppId = "";
-let lastSelectedMethod = "version";
+let lastSelectedMethod = "dxgi";
 
 function Content() {
   const [games, setGames] = useState<GameInfo[]>([]);
@@ -298,49 +274,16 @@ function Content() {
     }
   }, [loadStatus, selectedAppId, selectedGame]);
 
-  const statusText = useMemo(() => {
-    if (!selectedGame) return "Choose a game to manage its Proton prefix patch.";
+  const statusMessage = useMemo(() => {
+    if (!selectedGame) return "Choose a game to manage its patch state.";
     if (statusLoading) return "Loading patch status...";
     if (!status) return "No status loaded yet.";
     if (status.status === "error") return `Error: ${status.message || "Failed to load status."}`;
-
-    const lines = [
-      `Game: ${selectedGame.name}`,
-      `App ID: ${selectedGame.appid}`,
-      `Target ready: ${status.prefix_exists ? "Yes" : "No"}`,
-      `Patched: ${status.patched ? "Yes" : "No"}`,
-    ];
-
-    if (status.method) {
-      lines.push(`Current DLL name: ${status.proxy_filename || `${status.method}.dll`}`);
-    }
-
-    if (status.message) {
-      lines.push("");
-      lines.push(status.message);
-    }
-
-    return lines.join("\n");
+    return status.message || "Ready.";
   }, [selectedGame, status, statusLoading]);
 
-  const statusStyle = useMemo(() => {
-    if (statusLoading) return { ...STYLES.statusCard, ...STYLES.statusNeutral };
-    if (!status || status.status === "error") return { ...STYLES.statusCard, ...STYLES.statusError };
-    if (status.patched) return { ...STYLES.statusCard, ...STYLES.statusOk };
-    if (!status.prefix_exists) return { ...STYLES.statusCard, ...STYLES.statusWarn };
-    return { ...STYLES.statusCard, ...STYLES.statusNeutral };
-  }, [status, statusLoading]);
-
-  const resultStyle = useMemo(() => {
-    if (!resultMessage) return null;
-    if (resultMessage.startsWith("Error:")) {
-      return { ...STYLES.statusCard, ...STYLES.statusError };
-    }
-    return { ...STYLES.statusCard, ...STYLES.statusOk };
-  }, [resultMessage]);
-
   return (
-    <PanelSection title="Per-game prefix patching">
+    <PanelSection>
       <PanelSectionRow>
         <DropdownItem
           label="Target game"
@@ -362,7 +305,35 @@ function Content() {
       </PanelSectionRow>
 
       <PanelSectionRow>
-        <div style={statusStyle}>{statusText}</div>
+        <Field label="Game">{selectedGame?.name ?? "—"}</Field>
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <Field label="App ID">{selectedGame?.appid ?? "—"}</Field>
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <Field label="Target ready">
+          {selectedGame && status?.status === "success" ? (status.prefix_exists ? "Yes" : "No") : "—"}
+        </Field>
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <Field label="Patched">
+          {selectedGame && status?.status === "success" ? (status.patched ? "Yes" : "No") : "—"}
+        </Field>
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <Field label="Current DLL name">
+          {selectedGame && status?.status === "success" && status.method
+            ? (status.proxy_filename || `${status.method}.dll`)
+            : "—"}
+        </Field>
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <Field label="Status">{statusMessage}</Field>
       </PanelSectionRow>
 
       <PanelSectionRow>
@@ -406,9 +377,15 @@ function Content() {
         </ButtonItem>
       </PanelSectionRow>
 
-      {resultMessage && resultStyle ? (
+      {resultMessage ? (
         <PanelSectionRow>
-          <div style={resultStyle}>{resultMessage}</div>
+          <Field label="Last action">
+            <div>
+              {resultMessage.split("\n").map((line, index) => (
+                <div key={`${line}-${index}`}>{line || "\u00A0"}</div>
+              ))}
+            </div>
+          </Field>
         </PanelSectionRow>
       ) : null}
     </PanelSection>
