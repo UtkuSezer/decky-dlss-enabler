@@ -21,9 +21,10 @@ For a selected Steam game, the plugin:
 - backs up an existing stock DLL as `<name>.backup` when present
 - writes a managed marker file for deterministic cleanup
 - restores the original DLL on unpatch
-- updates Steam launch options to include:
-  - `WINEDLLOVERRIDES="<method>=n,b"`
-  - `SteamDeck=0`
+- replaces Steam launch options while patched with:
+  - `WINEDLLOVERRIDES=<method>=n,b`
+  - `SteamDeck=0 %command%`
+- restores the previous Steam launch options on unpatch
 
 ## Methods
 

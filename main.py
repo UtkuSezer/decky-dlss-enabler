@@ -2,7 +2,6 @@ import json
 import hashlib
 import os
 import re
-import shlex
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -560,110 +559,28 @@ class Plugin:
         self._log_target_state("prepare after", target_dir, method)
         return backup_created
 
-    def _is_env_assignment(self, token: str) -> bool:
-        if "=" not in token or token.startswith("-"):
-            return False
-        key_part = token.split("=", 1)[0]
-        return "/" not in key_part
-
-    def _parse_launch_option(self, raw_command: str) -> dict:
-        if not raw_command or not raw_command.strip():
-            return {"env_pairs": [], "prefix": [], "suffix": []}
-
-        try:
-            parts = shlex.split(raw_command)
-        except ValueError:
-            parts = raw_command.split()
-
-        try:
-            command_idx = parts.index("%command%")
-            left_parts = parts[:command_idx]
-            right_parts = parts[command_idx + 1 :]
-        except ValueError:
-            temp_left: list[str] = []
-            temp_right: list[str] = []
-
-            for index, part in enumerate(parts):
-                if self._is_env_assignment(part):
-                    temp_left.append(part)
-                    continue
-                if part.startswith("-") or part.startswith("+"):
-                    temp_right.append(part)
-                    temp_right.extend(parts[index + 1 :])
-                    break
-                temp_left.append(part)
-
-            left_parts = temp_left
-            right_parts = temp_right
-
-        env_pairs: list[tuple[str, str]] = []
-        prefix: list[str] = []
-        for part in left_parts:
-            if self._is_env_assignment(part):
-                key, value = part.split("=", 1)
-                env_pairs.append((key, value))
-            else:
-                prefix.append(part)
-
-        return {
-            "env_pairs": env_pairs,
-            "prefix": prefix,
-            "suffix": right_parts,
-        }
-
-    def _merge_winedlloverrides(self, existing_value: str, method: str) -> str:
-        method = self._normalize_method(method)
-        desired_entry = f"{method}=n,b"
-        entries = [entry.strip() for entry in (existing_value or "").split(";") if entry.strip()]
-        filtered = [entry for entry in entries if not entry.lower().startswith(f"{method.lower()}=")]
-        filtered.append(desired_entry)
-        return ";".join(filtered)
+    def _managed_launch_options(self, method: str) -> str:
+        normalized_method = self._normalize_method(method)
+        return f"WINEDLLOVERRIDES={normalized_method}=n,b SteamDeck=0 %command%"
 
     def _is_managed_launch_options(self, raw_command: str) -> bool:
         if not raw_command or not raw_command.strip():
             return False
 
-        parsed = self._parse_launch_option(raw_command)
-        env_map = {key: value for key, value in parsed["env_pairs"]}
-        if set(env_map.keys()) == {"WINEDLLOVERRIDES"} and not parsed["prefix"] and not parsed["suffix"]:
-            value = env_map["WINEDLLOVERRIDES"].strip().lower()
-            return value in {f"{method}=n,b" for method in SUPPORTED_METHODS}
-        return False
+        normalized_command = " ".join(raw_command.strip().split())
+        managed_commands = {self._managed_launch_options(method) for method in SUPPORTED_METHODS}
+        legacy_managed_commands = {f"WINEDLLOVERRIDES={method}=n,b" for method in SUPPORTED_METHODS}
+        return normalized_command in managed_commands or normalized_command in legacy_managed_commands
 
-    def _preserved_launch_options(self, current_launch_options: str, cleanup_original_launch_options: str = "") -> str:
+    def _original_launch_options_to_restore(self, current_launch_options: str, cleanup_original_launch_options: str = "") -> str:
         if cleanup_original_launch_options and not self._is_managed_launch_options(cleanup_original_launch_options):
             return cleanup_original_launch_options
         if self._is_managed_launch_options(current_launch_options):
             return ""
         return current_launch_options or ""
 
-    def _build_managed_launch_options(self, original_launch_options: str, method: str) -> str:
-        parsed = self._parse_launch_option(original_launch_options)
-        env_pairs = list(parsed["env_pairs"])
-        prefix = list(parsed["prefix"])
-        suffix = list(parsed["suffix"])
-
-        existing_winedlloverrides = ""
-        other_env_pairs: list[tuple[str, str]] = []
-        for key, value in env_pairs:
-            if key == "WINEDLLOVERRIDES":
-                existing_winedlloverrides = value
-            elif key == "SteamDeck":
-                continue
-            else:
-                other_env_pairs.append((key, value))
-
-        merged_env_pairs = [
-            ("WINEDLLOVERRIDES", self._merge_winedlloverrides(existing_winedlloverrides, method)),
-            ("SteamDeck", "0"),
-        ]
-        merged_env_pairs.extend(other_env_pairs)
-
-        parts = [f"{key}={value}" for key, value in merged_env_pairs]
-        parts.extend(prefix)
-        parts.append("%command%")
-        parts.extend(suffix)
-        return shlex.join(parts)
+    def _build_managed_launch_options(self, method: str) -> str:
+        return self._managed_launch_options(method)
 
     def _is_game_running(self, game_info: dict) -> bool:
         install_root = Path(game_info["install_path"])
@@ -774,7 +691,7 @@ class Plugin:
         try:
             normalized_method = self._normalize_method(method)
             self._log(
-                f"patch_game start: appid={appid} method={normalized_method} current_launch_options={json.dumps(current_launch_options)}"
+                f"patch_game start: appid={appid} method={normalized_method} original_launch_options={json.dumps(current_launch_options)}"
             )
             asset_path = self._verify_bundled_asset()
             game_info = self._game_record(str(appid))
@@ -796,12 +713,12 @@ class Plugin:
             self._log_target_state("patch before cleanup", target_dir, normalized_method)
 
             cleanup_result = self._cleanup_install_root(install_root)
-            preserved_launch_options = self._preserved_launch_options(
+            original_launch_options = self._original_launch_options_to_restore(
                 current_launch_options or "",
                 str(cleanup_result.get("original_launch_options") or ""),
             )
             self._log(
-                f"patch after cleanup: preserved_launch_options={json.dumps(preserved_launch_options)} cleanup_result={json.dumps(cleanup_result, sort_keys=True)}"
+                f"patch after cleanup: original_launch_options={json.dumps(original_launch_options)} cleanup_result={json.dumps(cleanup_result, sort_keys=True)}"
             )
 
             backup_created = self._prepare_target_proxy(target_dir, normalized_method)
@@ -824,12 +741,12 @@ class Plugin:
                 method=normalized_method,
                 target_dir=target_dir,
                 target_exe=target_exe,
-                original_launch_options=preserved_launch_options,
+                original_launch_options=original_launch_options,
                 backup_created=backup_created,
             )
             self._log(f"patch wrote marker: {json.dumps(self._read_marker_metadata(marker_path), sort_keys=True)}")
 
-            managed_launch_options = self._build_managed_launch_options(preserved_launch_options, normalized_method)
+            managed_launch_options = self._build_managed_launch_options(normalized_method)
             self._log(f"patch managed launch options: {json.dumps(managed_launch_options)}")
 
             result = {
@@ -840,7 +757,7 @@ class Plugin:
                 "proxy_filename": f"{normalized_method}.dll",
                 "marker_name": marker_path.name,
                 "launch_options": managed_launch_options,
-                "original_launch_options": preserved_launch_options,
+                "original_launch_options": original_launch_options,
                 "message": f"Patched {game_info['name']} using {normalized_method}.dll in the game directory.",
                 "paths": {
                     "install_root": str(install_root),
