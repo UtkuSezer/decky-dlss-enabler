@@ -237,7 +237,7 @@ function Content() {
   const patchButtonLabel = useMemo(() => {
     if (busyAction === "patch") return "Patching...";
     if (!selectedGame) return "Patch selected game";
-    if (!status?.prefix_exists) return "Launch the game once with Proton first";
+    if (!status?.prefix_exists) return "Patch target not found";
     if (status?.method && status.method !== selectedMethod) return `Switch to ${selectedMethodLabel}`;
     if (status?.marker_name) return `Reinstall ${selectedMethodLabel}`;
     return `Patch with ${selectedMethodLabel}`;
@@ -307,7 +307,7 @@ function Content() {
     const lines = [
       `Game: ${selectedGame.name}`,
       `App ID: ${selectedGame.appid}`,
-      `Prefix ready: ${status.prefix_exists ? "Yes" : "No"}`,
+      `Target ready: ${status.prefix_exists ? "Yes" : "No"}`,
       `Patched: ${status.patched ? "Yes" : "No"}`,
     ];
 
@@ -350,7 +350,7 @@ function Content() {
           selectedOption={selectedAppId}
           rgOptions={games.map((game) => ({
             data: game.appid,
-            label: game.prefix_exists ? game.name : `${game.name} (launch once first)`,
+            label: game.prefix_exists ? game.name : `${game.name} (target not found)`,
           }))}
           onChange={(option) => {
             const nextAppId = String(option.data);
@@ -383,7 +383,7 @@ function Content() {
       </PanelSectionRow>
 
       <PanelSectionRow>
-        <Field label="Selected DLL name" description="The bundled DLSS Enabler proxy will be copied into system32 using this filename.">
+        <Field label="Selected DLL name" description="The bundled DLSS Enabler proxy will be copied into the chosen game executable directory using this filename.">
           {selectedMethodLabel}
         </Field>
       </PanelSectionRow>

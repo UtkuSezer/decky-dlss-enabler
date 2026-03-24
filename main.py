@@ -4,12 +4,12 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 import decky
 
-PLUGIN_NAME = "decky-dlss-enabler"
 BUNDLED_ASSET_NAME = "version.dll"
 BUNDLED_ASSET_SHA256 = "a07b82de96e8c278184fe01409d7b4851a67865f7b8fed56332e40028dc3b41f"
 DLSS_ENABLER_VERSION = "4.3.1.0"
@@ -30,58 +30,33 @@ SUPPORTED_METHODS = [
     "dbghelp",
 ]
 
+UNREAL_HINTS = [
+    "/binaries/win64/",
+    "-win64-shipping.exe",
+    "shipping.exe",
+]
+
+BAD_EXE_SUBSTRINGS = [
+    "crashreport",
+    "crashreportclient",
+    "eac",
+    "easyanticheat",
+    "beclient",
+    "eosbootstrap",
+    "benchmark",
+    "uninstall",
+    "setup",
+    "launcher",
+    "updater",
+    "bootstrap",
+    "_redist",
+    "prereq",
+]
+
 
 class Plugin:
     def _log(self, message: str) -> None:
         decky.logger.info(f"[DLSS Enabler] {message}")
-
-    def _safe_sha256(self, path: Path) -> str | None:
-        try:
-            if path.exists() and path.is_file() and not path.is_symlink():
-                return self._file_sha256(path)
-        except Exception:
-            return None
-        return None
-
-    def _describe_path(self, path: Path) -> dict:
-        exists = path.exists() or path.is_symlink()
-        description = {
-            "path": str(path),
-            "exists": exists,
-            "is_symlink": path.is_symlink(),
-        }
-        if not exists:
-            return description
-
-        try:
-            stat_result = path.lstat() if path.is_symlink() else path.stat()
-            description["size"] = stat_result.st_size
-        except Exception:
-            pass
-
-        if path.is_symlink():
-            try:
-                description["symlink_target"] = os.readlink(path)
-            except Exception:
-                pass
-        else:
-            sha = self._safe_sha256(path)
-            if sha:
-                description["sha256"] = sha
-        return description
-
-    def _log_proxy_state(self, prefix: str, system32: Path, method: str) -> None:
-        normalized_method = self._normalize_method(method)
-        proxy_filename = f"{normalized_method}.dll"
-        proxy_path = system32 / proxy_filename
-        backup_path = system32 / f"{proxy_filename}{BACKUP_SUFFIX}"
-        marker_path = system32 / self._marker_filename(normalized_method)
-        markers = [marker.name for marker in self._marker_paths(system32)] if system32.exists() else []
-        self._log(
-            f"{prefix}: proxy={json.dumps(self._describe_path(proxy_path), sort_keys=True)} "
-            f"backup={json.dumps(self._describe_path(backup_path), sort_keys=True)} "
-            f"marker={json.dumps(self._describe_path(marker_path), sort_keys=True)} markers={markers}"
-        )
 
     async def _main(self):
         self._log("plugin loaded")
@@ -114,6 +89,14 @@ class Plugin:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def _safe_sha256(self, path: Path) -> str | None:
+        try:
+            if path.exists() and path.is_file() and not path.is_symlink():
+                return self._file_sha256(path)
+        except Exception:
+            return None
+        return None
+
     def _verify_bundled_asset(self) -> Path:
         asset_path = self._bundled_asset_path()
         if not asset_path.exists():
@@ -126,6 +109,37 @@ class Plugin:
                 f"Bundled asset hash mismatch for {asset_path.name}: expected {BUNDLED_ASSET_SHA256}, got {asset_hash}"
             )
         return asset_path
+
+    def _read_json_file(self, path: Path) -> dict:
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as file:
+                parsed = json.load(file)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_json_file(self, path: Path, payload: dict) -> None:
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2, sort_keys=True)
+
+    def _normalize_method(self, method: str | None) -> str:
+        normalized = (method or "version").replace(".dll", "").strip().lower()
+        if normalized not in SUPPORTED_METHODS:
+            raise ValueError(f"Unsupported injection method '{method}'")
+        return normalized
+
+    def _marker_filename(self, method: str) -> str:
+        return f"{MARKER_PREFIX}{self._normalize_method(method).upper()}{MARKER_SUFFIX}"
+
+    def _marker_method_from_name(self, marker_name: str) -> str | None:
+        pattern = rf"^{re.escape(MARKER_PREFIX)}([A-Z0-9]+){re.escape(MARKER_SUFFIX)}$"
+        match = re.match(pattern, marker_name)
+        if not match:
+            return None
+        parsed = match.group(1).lower()
+        return parsed if parsed in SUPPORTED_METHODS else None
 
     def _steam_root_candidates(self) -> list[Path]:
         home = self._home_path()
@@ -173,7 +187,7 @@ class Plugin:
                             library_paths.append(candidate)
                             seen.add(key)
             except Exception as exc:
-                decky.logger.error(f"Failed to parse {library_file}: {exc}")
+                self._log(f"failed to parse libraryfolders: {library_file} error={exc}")
 
         return library_paths
 
@@ -190,29 +204,36 @@ class Plugin:
                     "appid": "",
                     "name": "",
                     "library_path": str(library_path),
+                    "install_path": "",
                 }
+                install_dir = ""
                 try:
                     with open(appmanifest, "r", encoding="utf-8", errors="replace") as file:
                         for line in file:
                             if '"appid"' in line:
                                 game_info["appid"] = line.split('"appid"', 1)[1].strip().strip('"')
-                            if '"name"' in line:
+                            elif '"name"' in line:
                                 game_info["name"] = line.split('"name"', 1)[1].strip().strip('"')
+                            elif '"installdir"' in line:
+                                install_dir = line.split('"installdir"', 1)[1].strip().strip('"')
                 except Exception as exc:
-                    decky.logger.error(f"Skipping {appmanifest}: {exc}")
+                    self._log(f"skipping manifest {appmanifest}: {exc}")
                     continue
 
                 if not game_info["appid"] or not game_info["name"]:
                     continue
                 if "Proton" in game_info["name"] or "Steam Linux Runtime" in game_info["name"]:
                     continue
+
+                install_path = steamapps_path / "common" / install_dir if install_dir else Path()
+                game_info["install_path"] = str(install_path)
+
                 if appid is None or str(game_info["appid"]) == str(appid):
                     games.append(game_info)
 
         deduped: dict[str, dict] = {}
         for game in games:
             deduped[str(game["appid"])] = game
-
         return sorted(deduped.values(), key=lambda entry: entry["name"].lower())
 
     def _compatdata_dirs_for_appid(self, appid: str) -> list[Path]:
@@ -223,45 +244,109 @@ class Plugin:
                 matches.append(compatdata_dir)
         return matches
 
-    def _prefix_paths_for_appid(self, appid: str) -> dict | None:
-        compatdata_dirs = self._compatdata_dirs_for_appid(str(appid))
-        if not compatdata_dirs:
-            return None
+    def _game_record(self, appid: str) -> dict | None:
+        matches = self._find_installed_games(appid)
+        return matches[0] if matches else None
 
-        compatdata_dir = compatdata_dirs[0]
-        system32 = compatdata_dir / "pfx" / "drive_c" / "windows" / "system32"
-        return {
-            "compatdata_dir": compatdata_dir,
-            "system32": system32,
-        }
-
-    def _normalize_method(self, method: str | None) -> str:
-        normalized = (method or "version").replace(".dll", "").strip().lower()
-        if normalized not in SUPPORTED_METHODS:
-            raise ValueError(f"Unsupported injection method '{method}'")
+    def _normalized_path_string(self, value: str) -> str:
+        normalized = value.lower().replace("\\", "/")
+        normalized = normalized.replace("z:/", "/")
+        normalized = normalized.replace("//", "/")
         return normalized
 
-    def _marker_filename(self, method: str) -> str:
-        return f"{MARKER_PREFIX}{self._normalize_method(method).upper()}{MARKER_SUFFIX}"
+    def _candidate_executables(self, install_root: Path) -> list[Path]:
+        if not install_root.exists():
+            return []
 
-    def _marker_method_from_name(self, marker_name: str) -> str | None:
-        pattern = rf"^{re.escape(MARKER_PREFIX)}([A-Z0-9]+){re.escape(MARKER_SUFFIX)}$"
-        match = re.match(pattern, marker_name)
-        if not match:
+        candidates: list[Path] = []
+        try:
+            for exe in install_root.rglob("*.exe"):
+                if not exe.is_file():
+                    continue
+                candidates.append(exe)
+        except Exception as exc:
+            self._log(f"candidate exe scan failed for {install_root}: {exc}")
+        return candidates
+
+    def _exe_score(self, exe: Path, install_root: Path, game_name: str) -> int:
+        normalized = self._normalized_path_string(str(exe))
+        name = exe.name.lower()
+        score = 0
+
+        if normalized.endswith("-win64-shipping.exe"):
+            score += 300
+        if "shipping.exe" in name:
+            score += 220
+        if "/binaries/win64/" in normalized:
+            score += 200
+        if "/win64/" in normalized:
+            score += 80
+        if exe.parent == install_root:
+            score += 20
+
+        sanitized_game = re.sub(r"[^a-z0-9]", "", game_name.lower())
+        sanitized_name = re.sub(r"[^a-z0-9]", "", exe.stem.lower())
+        sanitized_root = re.sub(r"[^a-z0-9]", "", install_root.name.lower())
+        if sanitized_game and sanitized_game in sanitized_name:
+            score += 120
+        if sanitized_root and sanitized_root in sanitized_name:
+            score += 90
+
+        for bad in BAD_EXE_SUBSTRINGS:
+            if bad in normalized:
+                score -= 200
+
+        score -= len(exe.parts)
+        return score
+
+    def _best_running_executable(self, candidates: list[Path]) -> Path | None:
+        if not candidates:
             return None
-        parsed = match.group(1).lower()
-        return parsed if parsed in SUPPORTED_METHODS else None
 
-    def _marker_paths(self, system32: Path) -> list[Path]:
-        if not system32.exists():
+        try:
+            result = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True, check=False)
+            process_lines = result.stdout.splitlines()
+        except Exception as exc:
+            self._log(f"running executable scan failed: {exc}")
+            return None
+
+        normalized_candidates = [(exe, self._normalized_path_string(str(exe))) for exe in candidates]
+        matches: list[tuple[int, Path]] = []
+        for line in process_lines:
+            normalized_line = self._normalized_path_string(line)
+            for exe, normalized_exe in normalized_candidates:
+                if normalized_exe in normalized_line:
+                    matches.append((len(normalized_exe), exe))
+
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item[0], reverse=True)
+        return matches[0][1]
+
+    def _guess_patch_target(self, game_info: dict) -> tuple[Path, Path | None]:
+        install_root = Path(game_info["install_path"])
+        candidates = self._candidate_executables(install_root)
+        if not candidates:
+            return install_root, None
+
+        running_exe = self._best_running_executable(candidates)
+        if running_exe:
+            return running_exe.parent, running_exe
+
+        best = max(candidates, key=lambda exe: self._exe_score(exe, install_root, game_info["name"]))
+        return best.parent, best
+
+    def _find_markers_under_install_root(self, install_root: Path) -> list[Path]:
+        if not install_root.exists():
             return []
 
         markers: list[Path] = []
-        for entry in system32.iterdir():
-            if not entry.is_file():
-                continue
-            if self._marker_method_from_name(entry.name):
-                markers.append(entry)
+        try:
+            for marker in install_root.rglob(f"{MARKER_PREFIX}*{MARKER_SUFFIX}"):
+                if marker.is_file() and self._marker_method_from_name(marker.name):
+                    markers.append(marker)
+        except Exception as exc:
+            self._log(f"marker scan failed under {install_root}: {exc}")
 
         return sorted(markers, key=lambda path: path.stat().st_mtime, reverse=True)
 
@@ -272,20 +357,14 @@ class Plugin:
             "original_launch_options": "",
             "backup_created": False,
         }
-
         try:
-            with open(marker_path, "r", encoding="utf-8", errors="replace") as file:
-                raw = file.read().strip()
-            if raw:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    metadata.update(parsed)
+            parsed = self._read_json_file(marker_path)
+            if parsed:
+                metadata.update(parsed)
         except Exception:
             pass
-
         if not metadata.get("method"):
             metadata["method"] = self._marker_method_from_name(marker_path.name)
-
         return metadata
 
     def _write_marker_metadata(
@@ -295,6 +374,8 @@ class Plugin:
         appid: str,
         game_name: str,
         method: str,
+        target_dir: Path,
+        target_exe: Path | None,
         original_launch_options: str,
         backup_created: bool,
     ) -> None:
@@ -306,12 +387,52 @@ class Plugin:
             "asset_name": BUNDLED_ASSET_NAME,
             "asset_sha256": BUNDLED_ASSET_SHA256,
             "asset_version": DLSS_ENABLER_VERSION,
+            "target_dir": str(target_dir),
+            "target_exe": str(target_exe) if target_exe else "",
             "original_launch_options": original_launch_options,
             "backup_created": bool(backup_created),
             "patched_at": datetime.now(timezone.utc).isoformat(),
         }
-        with open(marker_path, "w", encoding="utf-8") as file:
-            json.dump(payload, file, indent=2, sort_keys=True)
+        self._write_json_file(marker_path, payload)
+
+    def _describe_path(self, path: Path) -> dict:
+        exists = path.exists() or path.is_symlink()
+        description = {
+            "path": str(path),
+            "exists": exists,
+            "is_symlink": path.is_symlink(),
+        }
+        if not exists:
+            return description
+
+        try:
+            stat_result = path.lstat() if path.is_symlink() else path.stat()
+            description["size"] = stat_result.st_size
+        except Exception:
+            pass
+
+        if path.is_symlink():
+            try:
+                description["symlink_target"] = os.readlink(path)
+            except Exception:
+                pass
+        else:
+            sha = self._safe_sha256(path)
+            if sha:
+                description["sha256"] = sha
+        return description
+
+    def _log_target_state(self, prefix: str, target_dir: Path, method: str) -> None:
+        normalized_method = self._normalize_method(method)
+        proxy_filename = f"{normalized_method}.dll"
+        proxy_path = target_dir / proxy_filename
+        backup_path = target_dir / f"{proxy_filename}{BACKUP_SUFFIX}"
+        marker_path = target_dir / self._marker_filename(normalized_method)
+        self._log(
+            f"{prefix}: proxy={json.dumps(self._describe_path(proxy_path), sort_keys=True)} "
+            f"backup={json.dumps(self._describe_path(backup_path), sort_keys=True)} "
+            f"marker={json.dumps(self._describe_path(marker_path), sort_keys=True)}"
+        )
 
     def _is_bundled_proxy_file(self, path: Path) -> bool:
         try:
@@ -337,11 +458,11 @@ class Plugin:
         else:
             path.unlink()
 
-    def _restore_method(self, system32: Path, method: str) -> list[str]:
+    def _restore_method_in_dir(self, target_dir: Path, method: str) -> list[str]:
         notes: list[str] = []
         proxy_filename = f"{self._normalize_method(method)}.dll"
-        proxy_path = system32 / proxy_filename
-        backup_path = system32 / f"{proxy_filename}{BACKUP_SUFFIX}"
+        proxy_path = target_dir / proxy_filename
+        backup_path = target_dir / f"{proxy_filename}{BACKUP_SUFFIX}"
 
         backup_exists = backup_path.exists() or backup_path.is_symlink()
         proxy_exists = proxy_path.exists() or proxy_path.is_symlink()
@@ -367,25 +488,27 @@ class Plugin:
 
         return notes
 
-    def _cleanup_managed_state(self, system32: Path) -> dict:
-        marker_paths = self._marker_paths(system32)
+    def _cleanup_install_root(self, install_root: Path) -> dict:
+        marker_paths = self._find_markers_under_install_root(install_root)
         notes: list[str] = []
         original_launch_options = ""
         cleaned_methods: list[str] = []
 
-        self._log(f"cleanup managed state: system32={system32} markers={[marker.name for marker in marker_paths]}")
+        self._log(f"cleanup install root: install_root={install_root} markers={[marker.name for marker in marker_paths]}")
         for marker_path in marker_paths:
             metadata = self._read_marker_metadata(marker_path)
-            self._log(f"cleanup marker metadata: {json.dumps(metadata, sort_keys=True)}")
             method = metadata.get("method")
             if not method:
                 continue
             if not original_launch_options:
                 original_launch_options = str(metadata.get("original_launch_options") or "")
-            self._log_proxy_state("cleanup before restore", system32, method)
-            notes.extend(self._restore_method(system32, method))
+
+            target_dir = marker_path.parent
+            self._log(f"cleanup marker metadata: {json.dumps(metadata, sort_keys=True)}")
+            self._log_target_state("cleanup before restore", target_dir, method)
+            notes.extend(self._restore_method_in_dir(target_dir, method))
             cleaned_methods.append(method)
-            self._log_proxy_state("cleanup after restore", system32, method)
+            self._log_target_state("cleanup after restore", target_dir, method)
             try:
                 marker_path.unlink()
                 self._log(f"cleanup removed marker: {marker_path}")
@@ -400,19 +523,19 @@ class Plugin:
         self._log(f"cleanup result: {json.dumps(result, sort_keys=True)}")
         return result
 
-    def _prepare_target_proxy(self, system32: Path, method: str) -> bool:
+    def _prepare_target_proxy(self, target_dir: Path, method: str) -> bool:
         method = self._normalize_method(method)
         proxy_filename = f"{method}.dll"
-        proxy_path = system32 / proxy_filename
-        backup_path = system32 / f"{proxy_filename}{BACKUP_SUFFIX}"
+        proxy_path = target_dir / proxy_filename
+        backup_path = target_dir / f"{proxy_filename}{BACKUP_SUFFIX}"
         backup_created = False
 
-        marker_for_method = system32 / self._marker_filename(method)
+        marker_for_method = target_dir / self._marker_filename(method)
         same_method_already_managed = marker_for_method.exists()
 
-        self._log_proxy_state("prepare before", system32, method)
+        self._log_target_state("prepare before", target_dir, method)
         self._log(
-            f"prepare target proxy: method={method} same_method_already_managed={same_method_already_managed} "
+            f"prepare target proxy: target_dir={target_dir} method={method} same_method_already_managed={same_method_already_managed} "
             f"proxy_is_bundled={self._is_bundled_proxy_file(proxy_path)} backup_exists={backup_path.exists() or backup_path.is_symlink()}"
         )
 
@@ -434,7 +557,7 @@ class Plugin:
                 backup_created = True
                 self._log(f"prepare moved existing proxy to backup {backup_path}")
 
-        self._log_proxy_state("prepare after", system32, method)
+        self._log_target_state("prepare after", target_dir, method)
         return backup_created
 
     def _is_env_assignment(self, token: str) -> bool:
@@ -464,12 +587,10 @@ class Plugin:
                 if self._is_env_assignment(part):
                     temp_left.append(part)
                     continue
-
                 if part.startswith("-") or part.startswith("+"):
                     temp_right.append(part)
                     temp_right.extend(parts[index + 1 :])
                     break
-
                 temp_left.append(part)
 
             left_parts = temp_left
@@ -477,7 +598,6 @@ class Plugin:
 
         env_pairs: list[tuple[str, str]] = []
         prefix: list[str] = []
-
         for part in left_parts:
             if self._is_env_assignment(part):
                 key, value = part.split("=", 1)
@@ -487,8 +607,8 @@ class Plugin:
 
         return {
             "env_pairs": env_pairs,
-            "prefix": right_or_default(prefix),
-            "suffix": right_or_default(right_parts),
+            "prefix": prefix,
+            "suffix": right_parts,
         }
 
     def _merge_winedlloverrides(self, existing_value: str, method: str) -> str:
@@ -498,6 +618,24 @@ class Plugin:
         filtered = [entry for entry in entries if not entry.lower().startswith(f"{method.lower()}=")]
         filtered.append(desired_entry)
         return ";".join(filtered)
+
+    def _is_managed_launch_options(self, raw_command: str) -> bool:
+        if not raw_command or not raw_command.strip():
+            return False
+
+        parsed = self._parse_launch_option(raw_command)
+        env_map = {key: value for key, value in parsed["env_pairs"]}
+        if set(env_map.keys()) == {"WINEDLLOVERRIDES"} and not parsed["prefix"] and not parsed["suffix"]:
+            value = env_map["WINEDLLOVERRIDES"].strip().lower()
+            return value in {f"{method}=n,b" for method in SUPPORTED_METHODS}
+        return False
+
+    def _preserved_launch_options(self, current_launch_options: str, cleanup_original_launch_options: str = "") -> str:
+        if cleanup_original_launch_options and not self._is_managed_launch_options(cleanup_original_launch_options):
+            return cleanup_original_launch_options
+        if self._is_managed_launch_options(current_launch_options):
+            return ""
+        return current_launch_options or ""
 
     def _build_managed_launch_options(self, original_launch_options: str, method: str) -> str:
         parsed = self._parse_launch_option(original_launch_options)
@@ -510,10 +648,15 @@ class Plugin:
         for key, value in env_pairs:
             if key == "WINEDLLOVERRIDES":
                 existing_winedlloverrides = value
+            elif key == "SteamDeck":
+                continue
             else:
                 other_env_pairs.append((key, value))
 
-        merged_env_pairs = [("WINEDLLOVERRIDES", self._merge_winedlloverrides(existing_winedlloverrides, method))]
+        merged_env_pairs = [
+            ("WINEDLLOVERRIDES", self._merge_winedlloverrides(existing_winedlloverrides, method)),
+            ("SteamDeck", "0"),
+        ]
         merged_env_pairs.extend(other_env_pairs)
 
         parts = [f"{key}={value}" for key, value in merged_env_pairs]
@@ -522,33 +665,34 @@ class Plugin:
         parts.extend(suffix)
         return shlex.join(parts)
 
+    def _is_game_running(self, game_info: dict) -> bool:
+        install_root = Path(game_info["install_path"])
+        candidates = self._candidate_executables(install_root)
+        return self._best_running_executable(candidates) is not None
+
     async def list_installed_games(self) -> dict:
         try:
             games = []
             for game in self._find_installed_games():
-                paths = self._prefix_paths_for_appid(str(game["appid"]))
-                prefix_exists = bool(paths and paths["system32"].exists())
+                install_root = Path(game["install_path"])
                 games.append(
                     {
                         "appid": str(game["appid"]),
                         "name": game["name"],
-                        "prefix_exists": prefix_exists,
+                        "prefix_exists": install_root.exists(),
                     }
                 )
-
             return {"status": "success", "games": games}
         except Exception as exc:
-            decky.logger.error(f"list_installed_games failed: {exc}")
+            self._log(f"list_installed_games failed: {exc}")
             return {"status": "error", "message": str(exc), "games": []}
 
     async def get_game_status(self, appid: str) -> dict:
         try:
             self._log(f"get_game_status start: appid={appid}")
-            paths = self._prefix_paths_for_appid(str(appid))
-            installed_game = self._find_installed_games(str(appid))
-            game_name = installed_game[0]["name"] if installed_game else str(appid)
-
-            if not paths:
+            game_info = self._game_record(str(appid))
+            game_name = game_info["name"] if game_info else str(appid)
+            if not game_info:
                 return {
                     "status": "success",
                     "appid": str(appid),
@@ -557,11 +701,11 @@ class Plugin:
                     "patched": False,
                     "method": None,
                     "proxy_filename": None,
-                    "message": "No compatdata prefix found for this game yet. Launch it once with Proton first.",
+                    "message": "Game install path could not be resolved.",
                 }
 
-            system32 = paths["system32"]
-            if not system32.exists():
+            install_root = Path(game_info["install_path"])
+            if not install_root.exists():
                 return {
                     "status": "success",
                     "appid": str(appid),
@@ -570,14 +714,14 @@ class Plugin:
                     "patched": False,
                     "method": None,
                     "proxy_filename": None,
-                    "message": "The Proton prefix has not been created yet. Launch the game once first.",
+                    "message": "Game install directory does not exist.",
                     "paths": {
-                        "compatdata": str(paths["compatdata_dir"]),
-                        "system32": str(system32),
+                        "install_root": str(install_root),
                     },
                 }
 
-            markers = self._marker_paths(system32)
+            target_dir, target_exe = self._guess_patch_target(game_info)
+            markers = self._find_markers_under_install_root(install_root)
             if not markers:
                 return {
                     "status": "success",
@@ -589,8 +733,9 @@ class Plugin:
                     "proxy_filename": None,
                     "message": "This game is not currently patched.",
                     "paths": {
-                        "compatdata": str(paths["compatdata_dir"]),
-                        "system32": str(system32),
+                        "install_root": str(install_root),
+                        "target_dir": str(target_dir),
+                        "target_exe": str(target_exe) if target_exe else "",
                     },
                 }
 
@@ -598,16 +743,13 @@ class Plugin:
             metadata = self._read_marker_metadata(marker)
             method = self._normalize_method(metadata.get("method") or "version")
             proxy_filename = f"{method}.dll"
-            proxy_path = system32 / proxy_filename
+            target_dir = marker.parent
+            proxy_path = target_dir / proxy_filename
             patched = proxy_path.exists() or proxy_path.is_symlink()
             self._log(f"get_game_status marker metadata: {json.dumps(metadata, sort_keys=True)}")
-            self._log_proxy_state("get_game_status", system32, method)
+            self._log_target_state("get_game_status", target_dir, method)
 
-            if patched:
-                message = f"Patched using {proxy_filename}."
-            else:
-                message = f"Managed marker found for {proxy_filename}, but the proxy DLL is missing. Patch again to repair or unpatch to clean up."
-
+            message = f"Patched using {proxy_filename}." if patched else f"Managed marker found for {proxy_filename}, but the proxy DLL is missing."
             return {
                 "status": "success",
                 "appid": str(appid),
@@ -619,12 +761,13 @@ class Plugin:
                 "marker_name": marker.name,
                 "message": message,
                 "paths": {
-                    "compatdata": str(paths["compatdata_dir"]),
-                    "system32": str(system32),
+                    "install_root": str(install_root),
+                    "target_dir": str(target_dir),
+                    "target_exe": str(metadata.get("target_exe") or ""),
                 },
             }
         except Exception as exc:
-            decky.logger.error(f"get_game_status failed for {appid}: {exc}")
+            self._log(f"get_game_status failed for {appid}: {exc}")
             return {"status": "error", "message": str(exc)}
 
     async def patch_game(self, appid: str, method: str, current_launch_options: str = "") -> dict:
@@ -634,35 +777,38 @@ class Plugin:
                 f"patch_game start: appid={appid} method={normalized_method} current_launch_options={json.dumps(current_launch_options)}"
             )
             asset_path = self._verify_bundled_asset()
-            paths = self._prefix_paths_for_appid(str(appid))
-            installed_game = self._find_installed_games(str(appid))
-            game_name = installed_game[0]["name"] if installed_game else str(appid)
+            game_info = self._game_record(str(appid))
+            if not game_info:
+                return {"status": "error", "message": "Game install path could not be resolved."}
 
-            if not paths or not paths["system32"].exists():
-                return {
-                    "status": "error",
-                    "message": "No Proton prefix found for this game yet. Launch it once with Proton first.",
-                }
+            if self._is_game_running(game_info):
+                return {"status": "error", "message": "Close the game before patching."}
 
-            system32 = paths["system32"]
-            system32.mkdir(parents=True, exist_ok=True)
-            self._log(f"patch_game paths: compatdata={paths['compatdata_dir']} system32={system32} asset={asset_path}")
-            self._log_proxy_state("patch before cleanup", system32, normalized_method)
+            install_root = Path(game_info["install_path"])
+            if not install_root.exists():
+                return {"status": "error", "message": "Game install directory does not exist."}
 
-            preserved_launch_options = current_launch_options or ""
-            cleanup_result = self._cleanup_managed_state(system32)
-            if cleanup_result["original_launch_options"]:
-                preserved_launch_options = cleanup_result["original_launch_options"]
+            target_dir, target_exe = self._guess_patch_target(game_info)
+            target_dir.mkdir(parents=True, exist_ok=True)
             self._log(
-                f"patch after cleanup: preserved_launch_options={json.dumps(preserved_launch_options)} "
-                f"cleanup_result={json.dumps(cleanup_result, sort_keys=True)}"
+                f"patch_game target selection: install_root={install_root} target_dir={target_dir} target_exe={target_exe}"
+            )
+            self._log_target_state("patch before cleanup", target_dir, normalized_method)
+
+            cleanup_result = self._cleanup_install_root(install_root)
+            preserved_launch_options = self._preserved_launch_options(
+                current_launch_options or "",
+                str(cleanup_result.get("original_launch_options") or ""),
+            )
+            self._log(
+                f"patch after cleanup: preserved_launch_options={json.dumps(preserved_launch_options)} cleanup_result={json.dumps(cleanup_result, sort_keys=True)}"
             )
 
-            backup_created = self._prepare_target_proxy(system32, normalized_method)
-            target_proxy_path = system32 / f"{normalized_method}.dll"
+            backup_created = self._prepare_target_proxy(target_dir, normalized_method)
+            target_proxy_path = target_dir / f"{normalized_method}.dll"
             self._log(f"patch copy start: source={asset_path} target={target_proxy_path}")
             shutil.copy2(asset_path, target_proxy_path)
-            self._log_proxy_state("patch after copy", system32, normalized_method)
+            self._log_target_state("patch after copy", target_dir, normalized_method)
 
             copied_hash = self._file_sha256(target_proxy_path)
             if copied_hash.lower() != BUNDLED_ASSET_SHA256.lower():
@@ -670,12 +816,14 @@ class Plugin:
                     f"Copied proxy hash mismatch for {target_proxy_path.name}: expected {BUNDLED_ASSET_SHA256}, got {copied_hash}"
                 )
 
-            marker_path = system32 / self._marker_filename(normalized_method)
+            marker_path = target_dir / self._marker_filename(normalized_method)
             self._write_marker_metadata(
                 marker_path,
                 appid=str(appid),
-                game_name=game_name,
+                game_name=game_info["name"],
                 method=normalized_method,
+                target_dir=target_dir,
+                target_exe=target_exe,
                 original_launch_options=preserved_launch_options,
                 backup_created=backup_created,
             )
@@ -683,29 +831,26 @@ class Plugin:
 
             managed_launch_options = self._build_managed_launch_options(preserved_launch_options, normalized_method)
             self._log(f"patch managed launch options: {json.dumps(managed_launch_options)}")
-            cleanup_notes = cleanup_result.get("notes") or []
-            message = f"Patched {game_name} using {normalized_method}.dll."
-            if cleanup_notes:
-                message = f"{message} Cleaned previous managed state first."
 
             result = {
                 "status": "success",
                 "appid": str(appid),
-                "name": game_name,
+                "name": game_info["name"],
                 "method": normalized_method,
                 "proxy_filename": f"{normalized_method}.dll",
                 "marker_name": marker_path.name,
                 "launch_options": managed_launch_options,
                 "original_launch_options": preserved_launch_options,
-                "message": message,
+                "message": f"Patched {game_info['name']} using {normalized_method}.dll in the game directory.",
                 "paths": {
-                    "compatdata": str(paths["compatdata_dir"]),
-                    "system32": str(system32),
+                    "install_root": str(install_root),
+                    "target_dir": str(target_dir),
+                    "target_exe": str(target_exe) if target_exe else "",
                     "proxy": str(target_proxy_path),
                     "marker": str(marker_path),
                 },
             }
-            self._log_proxy_state("patch success final state", system32, normalized_method)
+            self._log_target_state("patch success final state", target_dir, normalized_method)
             self._log(f"patch success: {json.dumps(result, sort_keys=True)}")
             return result
         except Exception as exc:
@@ -715,63 +860,62 @@ class Plugin:
     async def unpatch_game(self, appid: str) -> dict:
         try:
             self._log(f"unpatch_game start: appid={appid}")
-            paths = self._prefix_paths_for_appid(str(appid))
-            installed_game = self._find_installed_games(str(appid))
-            game_name = installed_game[0]["name"] if installed_game else str(appid)
+            game_info = self._game_record(str(appid))
+            if not game_info:
+                return {"status": "success", "appid": str(appid), "launch_options": "", "message": "Game install path could not be resolved."}
 
-            if not paths or not paths["system32"].exists():
+            if self._is_game_running(game_info):
+                return {"status": "error", "message": "Close the game before unpatching."}
+
+            install_root = Path(game_info["install_path"])
+            if not install_root.exists():
                 return {
                     "status": "success",
                     "appid": str(appid),
-                    "name": game_name,
+                    "name": game_info["name"],
                     "launch_options": "",
-                    "message": "No Proton prefix found for this game, so there is nothing to clean up in the prefix.",
+                    "message": "Game install directory does not exist.",
                 }
 
-            system32 = paths["system32"]
-            markers = self._marker_paths(system32)
+            markers = self._find_markers_under_install_root(install_root)
             self._log(f"unpatch markers: {[marker.name for marker in markers]}")
             for marker in markers:
                 marker_method = self._marker_method_from_name(marker.name)
                 if marker_method:
-                    self._log_proxy_state("unpatch before cleanup", system32, marker_method)
+                    self._log_target_state("unpatch before cleanup", marker.parent, marker_method)
+
             if not markers:
                 return {
                     "status": "success",
                     "appid": str(appid),
-                    "name": game_name,
+                    "name": game_info["name"],
                     "launch_options": "",
                     "message": "No managed DLSS Enabler marker was found for this game.",
                     "paths": {
-                        "compatdata": str(paths["compatdata_dir"]),
-                        "system32": str(system32),
+                        "install_root": str(install_root),
                     },
                 }
 
-            cleanup_result = self._cleanup_managed_state(system32)
+            cleanup_result = self._cleanup_install_root(install_root)
+            restored_launch_options = str(cleanup_result.get("original_launch_options") or "")
+            if self._is_managed_launch_options(restored_launch_options):
+                restored_launch_options = ""
+
             cleaned_methods = cleanup_result.get("cleaned_methods") or []
             methods_display = ", ".join(f"{method}.dll" for method in cleaned_methods) if cleaned_methods else "managed proxy"
-
             result = {
                 "status": "success",
                 "appid": str(appid),
-                "name": game_name,
-                "launch_options": cleanup_result.get("original_launch_options") or "",
-                "message": f"Unpatched {game_name} and restored {methods_display}.",
+                "name": game_info["name"],
+                "launch_options": restored_launch_options,
+                "message": f"Unpatched {game_info['name']} and restored {methods_display}.",
                 "paths": {
-                    "compatdata": str(paths["compatdata_dir"]),
-                    "system32": str(system32),
+                    "install_root": str(install_root),
                 },
                 "notes": cleanup_result.get("notes") or [],
             }
             self._log(f"unpatch success: {json.dumps(result, sort_keys=True)}")
-            for method in cleaned_methods:
-                self._log_proxy_state("unpatch final state", system32, method)
             return result
         except Exception as exc:
             decky.logger.error(f"[DLSS Enabler] unpatch_game failed for {appid}: {exc}")
             return {"status": "error", "message": str(exc)}
-
-
-def right_or_default(values: list[str]) -> list[str]:
-    return values if values else []
