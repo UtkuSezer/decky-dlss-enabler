@@ -104,11 +104,43 @@ class PatchUnpatchFlowTests(unittest.TestCase):
         self.asset_bytes = b"fake bundled dlss enabler dll"
         self.asset_path.write_bytes(self.asset_bytes)
         self.asset_hash = hashlib.sha256(self.asset_bytes).hexdigest()
+        self.legacy_asset_bytes = b"fake legacy dlss enabler dll"
+        self.legacy_asset_hash = hashlib.sha256(self.legacy_asset_bytes).hexdigest()
         self.plugin = PluginUnderTest(appid="123", name="Test Game", install_root=self.install_root, asset_path=self.asset_path)
+
+        self.fake_assets_by_version = {
+            "4.3.1.0": {
+                "version": "4.3.1.0",
+                "sha256": self.legacy_asset_hash,
+                "release_tag": "bins",
+            },
+            plugin_main.DLSS_ENABLER_VERSION: {
+                "version": plugin_main.DLSS_ENABLER_VERSION,
+                "sha256": self.asset_hash,
+                "release_tag": plugin_main.KNOWN_DLSS_ENABLER_ASSETS_BY_VERSION[plugin_main.DLSS_ENABLER_VERSION]["release_tag"],
+            },
+        }
         self.hash_patch = mock.patch.object(plugin_main, "BUNDLED_ASSET_SHA256", self.asset_hash)
+        self.version_map_patch = mock.patch.dict(plugin_main.KNOWN_DLSS_ENABLER_ASSETS_BY_VERSION, self.fake_assets_by_version, clear=True)
+        self.sha_map_patch = mock.patch.dict(
+            plugin_main.KNOWN_DLSS_ENABLER_ASSETS_BY_SHA256,
+            {asset["sha256"].lower(): asset for asset in self.fake_assets_by_version.values()},
+            clear=True,
+        )
+        self.token_map_patch = mock.patch.dict(
+            plugin_main.KNOWN_DLSS_ENABLER_ASSETS_BY_TOKEN,
+            {plugin_main._version_token(asset["version"]): asset for asset in self.fake_assets_by_version.values()},
+            clear=True,
+        )
         self.hash_patch.start()
+        self.version_map_patch.start()
+        self.sha_map_patch.start()
+        self.token_map_patch.start()
 
     def tearDown(self):
+        self.token_map_patch.stop()
+        self.sha_map_patch.stop()
+        self.version_map_patch.stop()
         self.hash_patch.stop()
         self.tempdir.cleanup()
 
@@ -131,8 +163,12 @@ class PatchUnpatchFlowTests(unittest.TestCase):
         self.assertTrue(proxy_path.exists())
         self.assertEqual(proxy_path.read_bytes(), self.asset_bytes)
         self.assertTrue(marker_path.exists())
+        self.assertEqual(marker_path.name, "DLSS_ENABLER_DXGI_DLL")
 
         marker = self.read_marker_metadata("dxgi")
+        self.assertEqual(marker["marker_format"], "stable")
+        self.assertEqual(marker["asset_version"], plugin_main.DLSS_ENABLER_VERSION)
+        self.assertEqual(marker["asset_sha256"], self.asset_hash)
         self.assertEqual(marker["original_launch_options"], "PROTON_LOG=1 %command%")
         self.assertFalse(marker["backup_created"])
         self.assertEqual(marker["target_exe"], str(self.exe_path))
@@ -187,6 +223,72 @@ class PatchUnpatchFlowTests(unittest.TestCase):
         self.assertEqual(result["original_launch_options"], "")
         marker = self.read_marker_metadata("dxgi")
         self.assertEqual(marker["original_launch_options"], "")
+
+    def test_get_game_status_reports_upgrade_available_for_legacy_marker(self):
+        proxy_path = self.target_dir / "dxgi.dll"
+        proxy_path.write_bytes(self.legacy_asset_bytes)
+        legacy_marker_path = self.target_dir / self.plugin._legacy_marker_filename("dxgi", "4.3.1.0")
+        legacy_marker_path.write_text(
+            json.dumps(
+                {
+                    "appid": "123",
+                    "game_name": "Test Game",
+                    "method": "dxgi",
+                    "proxy_filename": "dxgi.dll",
+                    "asset_name": plugin_main.BUNDLED_ASSET_NAME,
+                    "asset_sha256": self.legacy_asset_hash,
+                    "asset_version": "4.3.1.0",
+                    "original_launch_options": "PROTON_LOG=1 %command%",
+                    "target_exe": str(self.exe_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_async(self.plugin.get_game_status("123"))
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["patched"])
+        self.assertEqual(result["marker_name"], legacy_marker_path.name)
+        self.assertEqual(result["marker_format"], "legacy")
+        self.assertEqual(result["installed_asset_version"], "4.3.1.0")
+        self.assertEqual(result["bundled_asset_version"], plugin_main.DLSS_ENABLER_VERSION)
+        self.assertTrue(result["upgrade_available"])
+        self.assertFalse(result["reinstall_recommended"])
+        self.assertTrue(result["integrity_ok"])
+
+    def test_patch_game_upgrades_legacy_marker_and_rewrites_stable_marker(self):
+        proxy_path = self.target_dir / "dxgi.dll"
+        proxy_path.write_bytes(self.legacy_asset_bytes)
+        legacy_marker_path = self.target_dir / self.plugin._legacy_marker_filename("dxgi", "4.3.1.0")
+        legacy_marker_path.write_text(
+            json.dumps(
+                {
+                    "appid": "123",
+                    "game_name": "Test Game",
+                    "method": "dxgi",
+                    "proxy_filename": "dxgi.dll",
+                    "asset_name": plugin_main.BUNDLED_ASSET_NAME,
+                    "asset_sha256": self.legacy_asset_hash,
+                    "asset_version": "4.3.1.0",
+                    "original_launch_options": "MANGOHUD=1 %command% -windowed",
+                    "target_exe": str(self.exe_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_async(self.plugin.patch_game("123", "dxgi", "WINEDLLOVERRIDES=dxgi=n,b SteamDeck=0 %command%"))
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["original_launch_options"], "MANGOHUD=1 %command% -windowed")
+        self.assertFalse(legacy_marker_path.exists())
+        self.assertTrue((self.target_dir / self.plugin._marker_filename("dxgi")).exists())
+        self.assertEqual(proxy_path.read_bytes(), self.asset_bytes)
+        marker = self.read_marker_metadata("dxgi")
+        self.assertEqual(marker["marker_format"], "stable")
+        self.assertEqual(marker["asset_version"], plugin_main.DLSS_ENABLER_VERSION)
+        self.assertEqual(marker["original_launch_options"], "MANGOHUD=1 %command% -windowed")
 
 
 if __name__ == "__main__":

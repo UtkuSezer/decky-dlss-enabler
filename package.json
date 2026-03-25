@@ -1,6 +1,6 @@
 {
   "name": "decky-dlss-enabler",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Decky plugin to manage DLSS Enabler inside per-game Proton prefixes",
   "type": "module",
   "scripts": {
@@ -50,8 +50,8 @@
   "remote_binary_bundling": true,
   "remote_binary": [
     {
-      "sha256hash": "a07b82de96e8c278184fe01409d7b4851a67865f7b8fed56332e40028dc3b41f",
-      "url": "https://github.com/xXJSONDeruloXx/decky-dlss-enabler/releases/download/bins/version.dll",
+      "sha256hash": "7357292a3ced57c194f60bd2cbfc8f3837604b2365af114a2a4bc61508e9d5c6",
+      "url": "https://github.com/xXJSONDeruloXx/decky-dlss-enabler/releases/download/bins-dlss-enabler-4.4.0.2-dev/version.dll",
       "name": "version.dll"
     }
   ]

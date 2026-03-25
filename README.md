@@ -45,15 +45,18 @@ Default method: `dxgi`
 Managed marker format:
 
 ```text
-DLSS_ENABLER_4_3_1_0_<METHOD>_DLL
+DLSS_ENABLER_<METHOD>_DLL
 ```
+
+Legacy versioned markers from older plugin releases are still recognized and upgraded in place.
 
 ## Bundled asset
 
 Expected bundled file:
 
 - `bin/version.dll`
-- sha256 `a07b82de96e8c278184fe01409d7b4851a67865f7b8fed56332e40028dc3b41f`
+- version `4.4.0.2-dev`
+- sha256 `7357292a3ced57c194f60bd2cbfc8f3837604b2365af114a2a4bc61508e9d5c6`
 
 ## Build
 

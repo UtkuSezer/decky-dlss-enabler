@@ -10,12 +10,39 @@ from pathlib import Path
 import decky
 
 BUNDLED_ASSET_NAME = "version.dll"
-BUNDLED_ASSET_SHA256 = "a07b82de96e8c278184fe01409d7b4851a67865f7b8fed56332e40028dc3b41f"
-DLSS_ENABLER_VERSION = "4.3.1.0"
-DLSS_ENABLER_VERSION_TOKEN = DLSS_ENABLER_VERSION.replace(".", "_")
-MARKER_PREFIX = f"DLSS_ENABLER_{DLSS_ENABLER_VERSION_TOKEN}_"
+KNOWN_DLSS_ENABLER_ASSETS = [
+    {
+        "version": "4.3.1.0",
+        "sha256": "a07b82de96e8c278184fe01409d7b4851a67865f7b8fed56332e40028dc3b41f",
+        "release_tag": "bins",
+    },
+    {
+        "version": "4.4.0.2-dev",
+        "sha256": "7357292a3ced57c194f60bd2cbfc8f3837604b2365af114a2a4bc61508e9d5c6",
+        "release_tag": "bins-dlss-enabler-4.4.0.2-dev",
+    },
+]
+CURRENT_DLSS_ENABLER_VERSION = "4.4.0.2-dev"
+KNOWN_DLSS_ENABLER_ASSETS_BY_VERSION = {
+    asset["version"]: asset for asset in KNOWN_DLSS_ENABLER_ASSETS
+}
+DLSS_ENABLER_VERSION = CURRENT_DLSS_ENABLER_VERSION
+BUNDLED_ASSET_SHA256 = KNOWN_DLSS_ENABLER_ASSETS_BY_VERSION[DLSS_ENABLER_VERSION]["sha256"]
+MARKER_PREFIX = "DLSS_ENABLER_"
 MARKER_SUFFIX = "_DLL"
 BACKUP_SUFFIX = ".backup"
+
+
+def _version_token(version: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", version).strip("_").upper()
+
+
+KNOWN_DLSS_ENABLER_ASSETS_BY_SHA256 = {
+    asset["sha256"].lower(): asset for asset in KNOWN_DLSS_ENABLER_ASSETS
+}
+KNOWN_DLSS_ENABLER_ASSETS_BY_TOKEN = {
+    _version_token(asset["version"]): asset for asset in KNOWN_DLSS_ENABLER_ASSETS
+}
 
 SUPPORTED_METHODS = [
     "version",
@@ -132,13 +159,54 @@ class Plugin:
     def _marker_filename(self, method: str) -> str:
         return f"{MARKER_PREFIX}{self._normalize_method(method).upper()}{MARKER_SUFFIX}"
 
-    def _marker_method_from_name(self, marker_name: str) -> str | None:
-        pattern = rf"^{re.escape(MARKER_PREFIX)}([A-Z0-9]+){re.escape(MARKER_SUFFIX)}$"
-        match = re.match(pattern, marker_name)
-        if not match:
+    def _legacy_marker_filename(self, method: str, version: str) -> str:
+        normalized_method = self._normalize_method(method).upper()
+        return f"{MARKER_PREFIX}{_version_token(version)}_{normalized_method}{MARKER_SUFFIX}"
+
+    def _parse_marker_name(self, marker_name: str) -> dict | None:
+        stable_pattern = rf"^{re.escape(MARKER_PREFIX)}([A-Z0-9]+){re.escape(MARKER_SUFFIX)}$"
+        stable_match = re.match(stable_pattern, marker_name)
+        if stable_match:
+            parsed_method = stable_match.group(1).lower()
+            if parsed_method in SUPPORTED_METHODS:
+                return {
+                    "method": parsed_method,
+                    "asset_version": None,
+                    "asset_version_token": None,
+                    "marker_format": "stable",
+                }
+
+        legacy_pattern = rf"^{re.escape(MARKER_PREFIX)}([A-Z0-9_-]+)_([A-Z0-9]+){re.escape(MARKER_SUFFIX)}$"
+        legacy_match = re.match(legacy_pattern, marker_name)
+        if not legacy_match:
             return None
-        parsed = match.group(1).lower()
-        return parsed if parsed in SUPPORTED_METHODS else None
+
+        asset_version_token = legacy_match.group(1).upper()
+        parsed_method = legacy_match.group(2).lower()
+        if parsed_method not in SUPPORTED_METHODS:
+            return None
+
+        known_asset = KNOWN_DLSS_ENABLER_ASSETS_BY_TOKEN.get(asset_version_token)
+        return {
+            "method": parsed_method,
+            "asset_version": known_asset["version"] if known_asset else None,
+            "asset_version_token": asset_version_token,
+            "marker_format": "legacy",
+        }
+
+    def _marker_method_from_name(self, marker_name: str) -> str | None:
+        parsed = self._parse_marker_name(marker_name)
+        return parsed.get("method") if parsed else None
+
+    def _asset_info_for_version(self, version: str | None) -> dict | None:
+        if not version:
+            return None
+        return KNOWN_DLSS_ENABLER_ASSETS_BY_VERSION.get(str(version))
+
+    def _asset_info_for_sha256(self, sha256: str | None) -> dict | None:
+        if not sha256:
+            return None
+        return KNOWN_DLSS_ENABLER_ASSETS_BY_SHA256.get(str(sha256).lower())
 
     def _steam_root_candidates(self) -> list[Path]:
         home = self._home_path()
@@ -342,7 +410,8 @@ class Plugin:
         markers: list[Path] = []
         try:
             for marker in install_root.rglob(f"{MARKER_PREFIX}*{MARKER_SUFFIX}"):
-                if marker.is_file() and self._marker_method_from_name(marker.name):
+                parsed = self._parse_marker_name(marker.name)
+                if marker.is_file() and parsed and parsed.get("method"):
                     markers.append(marker)
         except Exception as exc:
             self._log(f"marker scan failed under {install_root}: {exc}")
@@ -350,9 +419,13 @@ class Plugin:
         return sorted(markers, key=lambda path: path.stat().st_mtime, reverse=True)
 
     def _read_marker_metadata(self, marker_path: Path) -> dict:
+        parsed_name = self._parse_marker_name(marker_path.name) or {}
         metadata = {
             "marker_name": marker_path.name,
-            "method": self._marker_method_from_name(marker_path.name),
+            "marker_format": parsed_name.get("marker_format"),
+            "method": parsed_name.get("method"),
+            "asset_version": parsed_name.get("asset_version"),
+            "asset_version_token": parsed_name.get("asset_version_token"),
             "original_launch_options": "",
             "backup_created": False,
         }
@@ -362,8 +435,22 @@ class Plugin:
                 metadata.update(parsed)
         except Exception:
             pass
+
         if not metadata.get("method"):
-            metadata["method"] = self._marker_method_from_name(marker_path.name)
+            metadata["method"] = parsed_name.get("method")
+        if not metadata.get("marker_format"):
+            metadata["marker_format"] = parsed_name.get("marker_format")
+        if not metadata.get("asset_version"):
+            metadata["asset_version"] = parsed_name.get("asset_version")
+        if not metadata.get("asset_version_token"):
+            metadata["asset_version_token"] = parsed_name.get("asset_version_token")
+
+        asset_from_version = self._asset_info_for_version(metadata.get("asset_version"))
+        if not metadata.get("asset_sha256") and asset_from_version:
+            metadata["asset_sha256"] = asset_from_version["sha256"]
+        if not metadata.get("release_tag") and asset_from_version:
+            metadata["release_tag"] = asset_from_version.get("release_tag")
+
         return metadata
 
     def _write_marker_metadata(
@@ -381,11 +468,13 @@ class Plugin:
         payload = {
             "appid": str(appid),
             "game_name": game_name,
+            "marker_format": "stable",
             "method": self._normalize_method(method),
             "proxy_filename": f"{self._normalize_method(method)}.dll",
             "asset_name": BUNDLED_ASSET_NAME,
             "asset_sha256": BUNDLED_ASSET_SHA256,
             "asset_version": DLSS_ENABLER_VERSION,
+            "release_tag": KNOWN_DLSS_ENABLER_ASSETS_BY_VERSION[DLSS_ENABLER_VERSION].get("release_tag"),
             "target_dir": str(target_dir),
             "target_exe": str(target_exe) if target_exe else "",
             "original_launch_options": original_launch_options,
@@ -438,6 +527,44 @@ class Plugin:
             return path.is_file() and self._file_sha256(path).lower() == BUNDLED_ASSET_SHA256.lower()
         except Exception:
             return False
+
+    def _installed_asset_state(self, proxy_path: Path, metadata: dict) -> dict:
+        marker_asset_sha256 = str(metadata.get("asset_sha256") or "") or None
+        marker_asset_version = str(metadata.get("asset_version") or "") or None
+        proxy_sha256 = self._safe_sha256(proxy_path)
+        proxy_asset = self._asset_info_for_sha256(proxy_sha256) if proxy_sha256 else None
+        marker_asset = self._asset_info_for_version(marker_asset_version) or self._asset_info_for_sha256(marker_asset_sha256)
+
+        installed_asset_version = None
+        if proxy_asset:
+            installed_asset_version = proxy_asset["version"]
+        elif marker_asset:
+            installed_asset_version = marker_asset["version"]
+
+        integrity_ok = None
+        if proxy_sha256 and marker_asset_sha256:
+            integrity_ok = proxy_sha256.lower() == marker_asset_sha256.lower()
+
+        upgrade_available = False
+        if proxy_sha256 and proxy_sha256.lower() != BUNDLED_ASSET_SHA256.lower() and proxy_asset:
+            upgrade_available = True
+        elif marker_asset_sha256 and marker_asset_sha256.lower() != BUNDLED_ASSET_SHA256.lower() and marker_asset:
+            upgrade_available = True
+
+        reinstall_recommended = bool(proxy_sha256 and integrity_ok is False)
+
+        return {
+            "marker_asset_version": marker_asset["version"] if marker_asset else marker_asset_version,
+            "marker_asset_sha256": marker_asset["sha256"] if marker_asset else marker_asset_sha256,
+            "installed_asset_version": installed_asset_version,
+            "installed_asset_sha256": proxy_sha256 or marker_asset_sha256,
+            "proxy_sha256": proxy_sha256,
+            "bundled_asset_version": DLSS_ENABLER_VERSION,
+            "bundled_asset_sha256": BUNDLED_ASSET_SHA256,
+            "upgrade_available": upgrade_available,
+            "reinstall_recommended": reinstall_recommended,
+            "integrity_ok": integrity_ok,
+        }
 
     def _unique_stash_path(self, path: Path, label: str) -> Path:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -663,10 +790,28 @@ class Plugin:
             target_dir = marker.parent
             proxy_path = target_dir / proxy_filename
             patched = proxy_path.exists() or proxy_path.is_symlink()
+            asset_state = self._installed_asset_state(proxy_path, metadata)
             self._log(f"get_game_status marker metadata: {json.dumps(metadata, sort_keys=True)}")
+            self._log(f"get_game_status asset state: {json.dumps(asset_state, sort_keys=True)}")
             self._log_target_state("get_game_status", target_dir, method)
 
-            message = f"Patched using {proxy_filename}." if patched else f"Managed marker found for {proxy_filename}, but the proxy DLL is missing."
+            if not patched:
+                message = f"Managed marker found for {proxy_filename}, but the proxy DLL is missing."
+            elif asset_state["reinstall_recommended"]:
+                message = f"Patched using {proxy_filename}, but the on-disk DLL does not match the recorded managed asset. Reinstall recommended."
+            elif asset_state["upgrade_available"]:
+                installed_version = asset_state.get("installed_asset_version") or asset_state.get("marker_asset_version") or "older version"
+                message = (
+                    f"Patched using {proxy_filename}. Upgrade available: {installed_version} → {DLSS_ENABLER_VERSION}."
+                )
+            else:
+                installed_version = asset_state.get("installed_asset_version") or asset_state.get("marker_asset_version")
+                message = (
+                    f"Patched using {proxy_filename} ({installed_version})."
+                    if installed_version
+                    else f"Patched using {proxy_filename}."
+                )
+
             return {
                 "status": "success",
                 "appid": str(appid),
@@ -676,7 +821,18 @@ class Plugin:
                 "method": method,
                 "proxy_filename": proxy_filename,
                 "marker_name": marker.name,
+                "marker_format": metadata.get("marker_format"),
                 "message": message,
+                "bundled_asset_version": asset_state["bundled_asset_version"],
+                "bundled_asset_sha256": asset_state["bundled_asset_sha256"],
+                "marker_asset_version": asset_state["marker_asset_version"],
+                "marker_asset_sha256": asset_state["marker_asset_sha256"],
+                "installed_asset_version": asset_state["installed_asset_version"],
+                "installed_asset_sha256": asset_state["installed_asset_sha256"],
+                "proxy_sha256": asset_state["proxy_sha256"],
+                "upgrade_available": asset_state["upgrade_available"],
+                "reinstall_recommended": asset_state["reinstall_recommended"],
+                "integrity_ok": asset_state["integrity_ok"],
                 "paths": {
                     "install_root": str(install_root),
                     "target_dir": str(target_dir),
@@ -756,6 +912,8 @@ class Plugin:
                 "method": normalized_method,
                 "proxy_filename": f"{normalized_method}.dll",
                 "marker_name": marker_path.name,
+                "bundled_asset_version": DLSS_ENABLER_VERSION,
+                "bundled_asset_sha256": BUNDLED_ASSET_SHA256,
                 "launch_options": managed_launch_options,
                 "original_launch_options": original_launch_options,
                 "message": f"Patched {game_info['name']} using {normalized_method}.dll in the game directory.",

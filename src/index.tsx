@@ -32,9 +32,21 @@ type GameStatusResponse = {
   method?: string | null;
   proxy_filename?: string | null;
   marker_name?: string;
+  marker_format?: string | null;
+  bundled_asset_version?: string;
+  bundled_asset_sha256?: string;
+  marker_asset_version?: string | null;
+  marker_asset_sha256?: string | null;
+  installed_asset_version?: string | null;
+  installed_asset_sha256?: string | null;
+  proxy_sha256?: string | null;
+  upgrade_available?: boolean;
+  reinstall_recommended?: boolean;
+  integrity_ok?: boolean | null;
   paths?: {
-    compatdata: string;
-    system32: string;
+    install_root?: string;
+    target_dir?: string;
+    target_exe?: string;
   };
 };
 
@@ -46,11 +58,14 @@ type PatchResponse = {
   method?: string;
   proxy_filename?: string;
   marker_name?: string;
+  bundled_asset_version?: string;
+  bundled_asset_sha256?: string;
   launch_options?: string;
   original_launch_options?: string;
   paths?: {
-    compatdata: string;
-    system32: string;
+    install_root?: string;
+    target_dir?: string;
+    target_exe?: string;
     proxy?: string;
     marker?: string;
   };
@@ -61,8 +76,9 @@ type UnpatchResponse = {
   message?: string;
   launch_options?: string;
   paths?: {
-    compatdata: string;
-    system32: string;
+    install_root?: string;
+    target_dir?: string;
+    target_exe?: string;
   };
   notes?: string[];
 };
@@ -215,6 +231,8 @@ function Content() {
     if (!selectedGame) return "Patch selected game";
     if (!status?.prefix_exists) return "Patch target not found";
     if (status?.method && status.method !== selectedMethod) return `Switch to ${selectedMethodLabel}`;
+    if (status?.reinstall_recommended) return `Reinstall ${selectedMethodLabel}`;
+    if (status?.upgrade_available) return `Upgrade to ${status.bundled_asset_version ?? selectedMethodLabel}`;
     if (status?.marker_name) return `Reinstall ${selectedMethodLabel}`;
     return `Patch with ${selectedMethodLabel}`;
   }, [busyAction, selectedGame, selectedMethodLabel, selectedMethod, status]);
@@ -274,12 +292,32 @@ function Content() {
     }
   }, [loadStatus, selectedAppId, selectedGame]);
 
+  const versionDisplay = useMemo(() => {
+    if (!selectedGame || status?.status !== "success" || !status.patched) {
+      return { text: "—", color: undefined as string | undefined };
+    }
+
+    const text = status.installed_asset_version || status.marker_asset_version || "Unknown";
+    if (status.reinstall_recommended) {
+      return { text, color: "#ff7b72" };
+    }
+    if (status.upgrade_available) {
+      return { text, color: "#ffd866" };
+    }
+    return { text, color: "#3fb950" };
+  }, [selectedGame, status]);
+
   const statusMessage = useMemo(() => {
     if (!selectedGame) return "Choose a game to manage its patch state.";
     if (statusLoading) return "Loading patch status...";
     if (!status) return "No status loaded yet.";
     if (status.status === "error") return `Error: ${status.message || "Failed to load status."}`;
-    return status.message || "Ready.";
+    if (!status.prefix_exists) return status.message || "Patch target not found.";
+    if (!status.patched) return status.message || "This game is not currently patched.";
+    if (status.reinstall_recommended || status.upgrade_available) {
+      return status.message || "An update is available.";
+    }
+    return "";
   }, [selectedGame, status, statusLoading]);
 
   return (
@@ -333,8 +371,26 @@ function Content() {
       </PanelSectionRow>
 
       <PanelSectionRow>
-        <Field label="Status">{statusMessage}</Field>
+        <Field label="DLSS Enabler version">
+          {versionDisplay.color ? (
+            <span style={{ color: versionDisplay.color, fontWeight: 600 }}>{versionDisplay.text}</span>
+          ) : versionDisplay.text}
+        </Field>
       </PanelSectionRow>
+
+      <PanelSectionRow>
+        <Field label="Bundled version">
+          {selectedGame && status?.status === "success"
+            ? (status.bundled_asset_version || "—")
+            : "—"}
+        </Field>
+      </PanelSectionRow>
+
+      {statusMessage ? (
+        <PanelSectionRow>
+          <Field label="Status">{statusMessage}</Field>
+        </PanelSectionRow>
+      ) : null}
 
       <PanelSectionRow>
         <DropdownItem
