@@ -22,26 +22,11 @@ For a selected Steam game, the plugin:
 - restores the previous Steam launch options on unpatch
 - optionally installs experimental FSR4 INT8 4.0.2b sidecar files (`amd_fidelityfx_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`, and `OptiScaler.ini`)
 
-## Methods
-
-- `version`
-- `winmm`
-- `d3d11`
-- `d3d12`
-- `dinput8`
-- `dxgi`
-- `wininet`
-- `winhttp`
-- `dbghelp`
-
-Default method: `dxgi`
-
 
 bundled files:
 
-- `bin/version.dll`
+- `bin/version.dll` (DLSS Enabler)
 - version `4.4.0.2-dev`
-- sha256 `7357292a3ced57c194f60bd2cbfc8f3837604b2365af114a2a4bc61508e9d5c6`
 - optional experimental FSR4 sidecar bundle:
   - `bin/amd_fidelityfx_dx12.dll`
   - `bin/amd_fidelityfx_upscaler_dx12.dll` (`4.0.2b`)
@@ -49,5 +34,7 @@ bundled files:
 ## Credits
 
 Artur Graniszewski - [Dlss Enabler](https://github.com/artur-graniszewski/dlss-enabler-main)
+
 OptiScaler team - [OptiScaler](https://github.com/optiscaler/OptiScaler)
+
 Deck Wizard - Early testing, community support, [tutorial](https://github.com/artur-graniszewski/dlss-enabler-main) and showcase videos 
